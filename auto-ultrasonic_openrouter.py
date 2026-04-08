@@ -4,11 +4,10 @@ import websockets
 import time
 import statistics
 import json
-import requests  # For OpenRouter API
+import requests
 from collections import deque
 from gpiozero import Motor, PWMOutputDevice
 from ultralytics import YOLO
-import base64
 from datetime import datetime
 
 # ─────────────────────────────────────────────
@@ -21,7 +20,6 @@ right_pwm   = PWMOutputDevice(19)
 
 BASE_SPEED  = 0.1
 TURN_SPEED  = 0.1  
-INNER_SPEED = 0.1
 
 def _set_pwm(l, r):
     left_pwm.value  = max(0.0, min(1.0, l))
@@ -64,7 +62,6 @@ cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH,  320)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
 model = YOLO('yolov8n.pt')
-FRAME_W, FRAME_H = 320, 240
 
 # ─────────────────────────────────────────────
 # ULTRASONIC SENSOR
@@ -124,9 +121,21 @@ async def start_ws_server():
 # ─────────────────────────────────────────────
 # OPENROUTER INTEGRATION
 # ─────────────────────────────────────────────
-OPENROUTER_URL = "https://api.openrouter.ai/v1/chat/completions"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_KEY = ""
-MODEL_NAME = "google/gemma-4-26b-a4b-it:free"  # Replace with your OpenRouter model
+MODEL_NAME = "google/gemma-4-26b-a4b-it:free"
+
+# Simple obstacle avoidance when AI fails
+def simple_obstacle_avoidance(distance, blocked):
+    """Fallback logic when AI is unavailable"""
+    if blocked or distance < 0.3:
+        print(f"[FALLBACK] Obstacle at {distance:.2f}m - turning right")
+        return "right"
+    elif distance < 0.5:
+        print(f"[FALLBACK] Close obstacle at {distance:.2f}m - turning slightly")
+        return "left"
+    else:
+        return "front"
 
 def extract_yolo_data(results, frame_shape):
     """Extract YOLO detection data as JSON"""
@@ -151,13 +160,15 @@ def extract_yolo_data(results, frame_shape):
 def get_ai_direction(yolo_data, distance, timestamp):
     """Send YOLO + distance to OpenRouter and get direction"""
     
-    system_prompt = """You are controlling an autonomous rover. Analyze ONLY the YOLO detection data.
+    system_prompt = """You are controlling an autonomous rover. Analyze the YOLO detection data and distance sensor.
+If distance < 0.3 meters, respond with "back" or "turn".
+If objects are detected, navigate around them.
 RESPOND WITH EXACTLY ONE WORD: "front", "back", "right", "left", "stop"
-NEVER explain. ONE WORD ONLY."""
+ONE WORD ONLY."""
 
     context = json.dumps({
         "timestamp": timestamp,
-        "distance": distance,
+        "distance_meters": distance,
         "yolo_detections": yolo_data
     }, indent=2)
 
@@ -172,26 +183,44 @@ NEVER explain. ONE WORD ONLY."""
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": context}
         ],
-        "temperature": 0.1
+        "temperature": 0.1,
+        "max_tokens": 10  # Limit response length
     }
 
     try:
-        resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=15.0)
+        resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=10.0)
+        
+        if resp.status_code == 429:
+            print(f"[AI] Rate limited - using fallback")
+            return None  # Signal to use fallback
+            
         resp.raise_for_status()
         result = resp.json()
         direction = result["choices"][0]["message"]["content"].strip().lower()
-        print(f"[AI] Direction: {direction}")
-        return direction
+        
+        # Validate response
+        if direction in ["front", "back", "right", "left", "stop"]:
+            print(f"[AI] Direction: {direction}")
+            return direction
+        else:
+            print(f"[AI] Invalid response: {direction}")
+            return None
+            
     except Exception as e:
         print(f"[AI] OpenRouter error: {e}")
-        return "stop"
+        return None
 
 # ─────────────────────────────────────────────
 # AI ROVER LOOP
 # ─────────────────────────────────────────────
 async def ai_rover_loop():
-    print("[AI-ROVER] Starting YOLO+OpenRouter navigation (0.5s cycles)")
+    print("[AI-ROVER] Starting navigation with 10s AI requests + fallback")
     last_capture = 0
+    last_request_time = 0
+    REQUEST_DELAY = 10.0
+    last_direction = "front"  # Start moving forward by default
+    consecutive_failures = 0
+    
     while True:
         current_time = time.time()
         if current_time - last_capture >= 0.5:
@@ -203,23 +232,54 @@ async def ai_rover_loop():
             frame = cv2.flip(frame, 0)
             timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
+            # Run YOLO detection
             results = model.predict(frame, conf=0.25, verbose=False)
             yolo_data = extract_yolo_data(results, frame.shape)
 
+            # Get distance
             distance = filtered_distance()
             blocked = obstacle_blocking()
 
-            direction = get_ai_direction(yolo_data, distance, timestamp)
-
-            if direction == "front": drive_forward()
-            elif direction == "back": drive_back()
-            elif direction == "right": turn_right()
-            elif direction == "left": turn_left()
-            elif direction == "stop": stop_motors()
-            else: stop_motors()
+            # Decide direction
+            direction = None
+            
+            # Only call OpenRouter if delay has passed
+            if current_time - last_request_time >= REQUEST_DELAY:
+                direction = get_ai_direction(yolo_data, distance, timestamp)
+                last_request_time = current_time
+                
+                if direction is None:
+                    consecutive_failures += 1
+                else:
+                    consecutive_failures = 0
+                    last_direction = direction
+            
+            # Use fallback if AI failed or we have too many failures
+            if direction is None:
+                if consecutive_failures >= 2:
+                    # Use simple obstacle avoidance
+                    direction = simple_obstacle_avoidance(distance, blocked)
+                else:
+                    # Keep last working direction
+                    direction = last_direction
+                    print(f"[FALLBACK] Using last direction: {direction}")
+            
+            # Execute movement
+            if direction == "front": 
+                drive_forward()
+            elif direction == "back": 
+                drive_back()
+            elif direction == "right": 
+                turn_right()
+            elif direction == "left": 
+                turn_left()
+            elif direction == "stop": 
+                stop_motors()
+            else: 
+                stop_motors()
 
             last_capture = current_time
-            print(f"[CYCLE] {timestamp} | dist={distance:.2f}m | objs={len(yolo_data)} | dir={direction} | blocked={blocked}")
+            print(f"[CYCLE] {timestamp} | dist={distance:.2f}m | objs={len(yolo_data)} | dir={direction} | blocked={blocked} | fails={consecutive_failures}")
 
         await asyncio.sleep(0.05)
 
@@ -231,7 +291,7 @@ async def run():
 
 if __name__ == "__main__":
     try:
-        print("[SETUP] Using OpenRouter API instead of Ollama")
+        print("[SETUP] OpenRouter with 10s rate limiting + obstacle avoidance fallback")
         asyncio.run(run())
     except KeyboardInterrupt:
         print("\n[ROVER] Shutdown")
